@@ -1,0 +1,437 @@
+# app.py - Complete Render-ready application
+import os
+import re
+import json
+import random
+import uuid
+import asyncio
+from datetime import datetime
+from typing import Optional, Dict, Any
+from contextlib import asynccontextmanager
+
+import httpx
+from fastapi import FastAPI, HTTPException, Depends, Query, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, validator
+import redis.asyncio as redis
+
+# ========== CONFIGURATION ==========
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+API_KEY = os.getenv("API_KEY", "change-me-in-render-environment-variables")
+PORT = int(os.getenv("PORT", 10000))
+ENVIRONMENT = os.getenv("ENVIRONMENT", "production")
+
+# ========== MODELS ==========
+class CardInfo(BaseModel):
+    number: str = Field(..., min_length=15, max_length=16)
+    month: str = Field(..., regex="^(0[1-9]|1[0-2])$")
+    year: str = Field(..., regex="^\\d{2,4}$")
+    cvv: str = Field(..., regex="^\\d{3,4}$")
+    
+    @validator('year')
+    def validate_year(cls, v):
+        if len(v) == 2:
+            return f"20{v}"
+        return v
+
+class ChargeRequest(BaseModel):
+    shopify_url: str = Field(..., example="https://yourstore.myshopify.com")
+    card: CardInfo
+    product_handle: Optional[str] = None
+    quantity: int = Field(1, ge=1, le=10)
+    webhook_url: Optional[str] = None
+    webhook_headers: Optional[Dict[str, str]] = None
+
+class ChargeResponse(BaseModel):
+    request_id: str
+    status: str
+    message: Optional[str] = None
+    order_id: Optional[str] = None
+
+# ========== REDIS SETUP ==========
+redis_client: redis.Redis = None
+
+# ========== FASTAPI APP ==========
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global redis_client
+    # Startup
+    redis_client = await redis.from_url(REDIS_URL, decode_responses=True)
+    await redis_client.ping()
+    print(f"✅ Redis connected: {REDIS_URL}")
+    print(f"🚀 API running on port {PORT}")
+    print(f"🔑 API Key configured: {API_KEY[:10]}...")
+    yield
+    # Shutdown
+    if redis_client:
+        await redis_client.close()
+
+app = FastAPI(
+    title="Shopify Charge API",
+    description="Auto Shopify Payment Processor - Deployed on Render",
+    version="2.0.0",
+    lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ========== AUTH DEPENDENCY ==========
+async def verify_key(api_key: str = Query(..., alias="api_key")):
+    if api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return api_key
+
+# ========== ENDPOINTS ==========
+@app.get("/")
+async def root():
+    return {
+        "service": "Shopify Charge API",
+        "status": "operational",
+        "environment": ENVIRONMENT,
+        "version": "2.0.0",
+        "endpoints": {
+            "POST /charge": "Submit charge request",
+            "GET /status/{request_id}": "Check request status",
+            "GET /health": "Health check"
+        }
+    }
+
+@app.get("/health")
+async def health():
+    try:
+        await redis_client.ping()
+        redis_status = "connected"
+    except Exception as e:
+        redis_status = f"disconnected: {str(e)}"
+    return {
+        "status": "healthy" if redis_status == "connected" else "degraded",
+        "redis": redis_status,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+@app.post("/charge", response_model=ChargeResponse)
+async def create_charge(
+    request: ChargeRequest,
+    background_tasks: BackgroundTasks,
+    api_key: str = Depends(verify_key)
+):
+    """Submit a card for Shopify checkout"""
+    
+    request_id = str(uuid.uuid4())
+    
+    # Store in Redis
+    await redis_client.hset(
+        f"charge:{request_id}",
+        mapping={
+            "status": "queued",
+            "shopify_url": request.shopify_url,
+            "created_at": datetime.utcnow().isoformat(),
+            "card_last4": request.card.number[-4:],
+            "quantity": str(request.quantity)
+        }
+    )
+    await redis_client.expire(f"charge:{request_id}", 3600)
+    
+    # Process in background
+    background_tasks.add_task(process_charge, request_id, request)
+    
+    return ChargeResponse(
+        request_id=request_id,
+        status="queued",
+        message="Charge request queued. Poll /status/{request_id} for results"
+    )
+
+@app.get("/status/{request_id}")
+async def get_status(request_id: str, api_key: str = Depends(verify_key)):
+    """Check charge request status"""
+    
+    data = await redis_client.hgetall(f"charge:{request_id}")
+    if not data:
+        raise HTTPException(status_code=404, detail="Request not found")
+    
+    return {
+        "request_id": request_id,
+        "status": data.get("status", "unknown"),
+        "result": data.get("result", None),
+        "order_id": data.get("order_id", None),
+        "error": data.get("error", None),
+        "created_at": data.get("created_at", None)
+    }
+
+# ========== CORE PROCESSING ==========
+async def process_charge(request_id: str, request: ChargeRequest):
+    """Background processor - full Shopify checkout flow"""
+    
+    try:
+        await redis_client.hset(f"charge:{request_id}", "status", "processing")
+        
+        async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
+            # Step 1: Get store info and product
+            products_url = f"{request.shopify_url}/products.json"
+            products_resp = await client.get(products_url)
+            
+            if products_resp.status_code != 200:
+                raise Exception(f"Failed to fetch products: {products_resp.status_code}")
+            
+            products = products_resp.json().get("products", [])
+            if not products:
+                raise Exception("No products found in store")
+            
+            # Find product by handle or use first
+            product = products[0]
+            if request.product_handle:
+                for p in products:
+                    if p.get("handle") == request.product_handle:
+                        product = p
+                        break
+            
+            variant_id = product["variants"][0]["id"]
+            product_title = product.get("title", "Unknown")
+            price = product["variants"][0]["price"]
+            
+            await redis_client.hset(f"charge:{request_id}", "product", product_title)
+            
+            # Step 2: Add to cart
+            cart_add = await client.post(
+                f"{request.shopify_url}/cart/add.js",
+                data={"id": variant_id, "quantity": request.quantity}
+            )
+            if cart_add.status_code != 200:
+                raise Exception("Failed to add product to cart")
+            
+            # Step 3: Get cart token
+            cart_data = await client.get(f"{request.shopify_url}/cart.js")
+            cart_json = cart_data.json()
+            token = cart_json.get("token")
+            
+            # Step 4: Get checkout page and extract tokens
+            checkout_resp = await client.get(f"{request.shopify_url}/checkout")
+            html = checkout_resp.text
+            
+            # Extract session token
+            session_token_match = re.search(r'serialized-sessionToken&quot;:&quot;([^&]+)&quot;', html)
+            session_token = session_token_match.group(1) if session_token_match else None
+            
+            if not session_token:
+                raise Exception("Could not extract session token from checkout")
+            
+            # Extract queue token and stable ID
+            queue_token_match = re.search(r'queueToken&quot;:&quot;([^&]+)&quot;', html)
+            queue_token = queue_token_match.group(1) if queue_token_match else ""
+            
+            stable_id_match = re.search(r'stableId&quot;:&quot;([^&]+)&quot;', html)
+            stable_id = stable_id_match.group(1) if stable_id_match else ""
+            
+            payment_method_match = re.search(r'paymentMethodIdentifier&quot;:&quot;([^&]+)&quot;', html)
+            payment_method_id = payment_method_match.group(1) if payment_method_match else ""
+            
+            # Step 5: Generate random address
+            fname, lname, email, phone, add1, city, state_short, zip_code = generate_address()
+            
+            # Step 6: Tokenize card
+            tokenize_payload = {
+                "credit_card": {
+                    "number": request.card.number,
+                    "name": f"{fname} {lname}",
+                    "month": int(request.card.month),
+                    "year": int(request.card.year),
+                    "verification_value": request.card.cvv
+                }
+            }
+            
+            tokenize_resp = await client.post(
+                "https://deposit.us.shopifycs.com/sessions",
+                json=tokenize_payload,
+                headers={"Content-Type": "application/json", "User-Agent": get_user_agent()}
+            )
+            
+            if tokenize_resp.status_code != 200:
+                raise Exception(f"Card tokenization failed: {tokenize_resp.status_code}")
+            
+            session_id = tokenize_resp.json().get("id")
+            if not session_id:
+                raise Exception("No session ID returned from tokenization")
+            
+            # Step 7: Build GraphQL mutation
+            graphql_url = f"{request.shopify_url}/checkouts/unstable/graphql"
+            
+            graphql_payload = {
+                "operationName": "SubmitForCompletion",
+                "variables": {
+                    "input": {
+                        "sessionInput": {"sessionToken": session_token},
+                        "queueToken": queue_token,
+                        "discounts": {"lines": [], "acceptUnexpectedDiscounts": True},
+                        "merchandise": {
+                            "merchandiseLines": [{
+                                "stableId": stable_id,
+                                "merchandise": {
+                                    "productVariantReference": {
+                                        "id": f"gid://shopify/ProductVariant/{variant_id}",
+                                        "variantId": f"gid://shopify/ProductVariant/{variant_id}"
+                                    }
+                                },
+                                "quantity": {"items": {"value": request.quantity}}
+                            }]
+                        },
+                        "delivery": {
+                            "deliveryLines": [{
+                                "selectedDeliveryStrategy": {
+                                    "deliveryStrategyMatchingConditions": {"shipments": {"any": True}}
+                                },
+                                "targetMerchandiseLines": {"lines": [{"stableId": stable_id}]},
+                                "destination": {
+                                    "streetAddress": {
+                                        "address1": add1, "address2": "", "city": city,
+                                        "countryCode": "US", "postalCode": zip_code,
+                                        "company": "", "firstName": fname, "lastName": lname,
+                                        "zoneCode": state_short, "phone": phone
+                                    }
+                                },
+                                "deliveryMethodTypes": ["SHIPPING"],
+                                "destinationChanged": True
+                            }]
+                        },
+                        "payment": {
+                            "paymentLines": [{
+                                "paymentMethod": {
+                                    "directPaymentMethod": {
+                                        "paymentMethodIdentifier": payment_method_id,
+                                        "sessionId": session_id,
+                                        "billingAddress": {
+                                            "streetAddress": {
+                                                "address1": add1, "address2": "", "city": city,
+                                                "countryCode": "US", "postalCode": zip_code,
+                                                "company": "", "firstName": fname, "lastName": lname,
+                                                "zoneCode": state_short, "phone": phone
+                                            }
+                                        }
+                                    }
+                                },
+                                "amount": {"any": True}
+                            }],
+                            "billingAddress": {
+                                "streetAddress": {
+                                    "address1": add1, "address2": "", "city": city,
+                                    "countryCode": "US", "postalCode": zip_code,
+                                    "company": "", "firstName": fname, "lastName": lname,
+                                    "zoneCode": state_short, "phone": phone
+                                }
+                            }
+                        },
+                        "buyerIdentity": {
+                            "buyerIdentity": {"presentmentCurrency": "USD", "countryCode": "US"},
+                            "contactInfoV2": {"emailOrSms": {"value": email, "emailOrSmsChanged": False}},
+                            "marketingConsent": [{"email": {"value": email}}]
+                        },
+                        "tip": {"tipLines": []},
+                        "taxes": {
+                            "proposedTotalAmount": {"value": {"amount": "0", "currencyCode": "USD"}}
+                        }
+                    },
+                    "attemptToken": f"{token}-{random.random()}",
+                    "analytics": {"pageId": str(uuid.uuid4())}
+                }
+            }
+            
+            headers = {
+                "x-checkout-one-session-token": session_token,
+                "x-checkout-web-source-id": token,
+                "Content-Type": "application/json",
+                "User-Agent": get_user_agent()
+            }
+            
+            # Step 8: Submit payment
+            final_resp = await client.post(graphql_url, json=graphql_payload, headers=headers)
+            result = final_resp.json()
+            
+            completion = result.get("data", {}).get("submitForCompletion", {})
+            receipt = completion.get("receipt", {})
+            
+            if receipt.get("id"):
+                order_result = {
+                    "status": "approved",
+                    "result": "Payment successful",
+                    "order_id": receipt.get("id", "pending"),
+                    "receipt_id": receipt.get("id")
+                }
+                await redis_client.hset(f"charge:{request_id}", order_result)
+                
+                # Send webhook
+                if request.webhook_url:
+                    await send_webhook(request.webhook_url, {
+                        "request_id": request_id,
+                        "status": "approved",
+                        "order_id": receipt.get("id"),
+                        "product": product_title,
+                        "price": price
+                    }, request.webhook_headers)
+            else:
+                error_msg = completion.get("reason", "Payment declined")
+                raise Exception(error_msg)
+                
+    except Exception as e:
+        error_msg = str(e)
+        await redis_client.hset(f"charge:{request_id}", mapping={
+            "status": "failed",
+            "result": error_msg,
+            "error": error_msg
+        })
+        
+        if request.webhook_url:
+            await send_webhook(request.webhook_url, {
+                "request_id": request_id,
+                "status": "failed",
+                "error": error_msg
+            }, request.webhook_headers)
+
+# ========== HELPER FUNCTIONS ==========
+def get_user_agent() -> str:
+    agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/119.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Firefox/119.0"
+    ]
+    return random.choice(agents)
+
+def generate_address():
+    addresses = [
+        ("123 Main St", "Portland", "ME", "04101"),
+        ("456 Oak Ave", "Austin", "TX", "78701"),
+        ("789 Pine Rd", "Miami", "FL", "33132"),
+        ("321 Elm St", "Seattle", "WA", "98101"),
+        ("654 Maple Dr", "Denver", "CO", "80202")
+    ]
+    add1, city, state, zip_code = random.choice(addresses)
+    
+    first_names = ["John", "Emma", "Michael", "Sophia", "James", "Olivia"]
+    last_names = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia"]
+    
+    fname = random.choice(first_names)
+    lname = random.choice(last_names)
+    email = f"{fname.lower()}.{lname.lower()}{random.randint(1,999)}@gmail.com"
+    phone = f"555{random.randint(1000000, 9999999)}"
+    
+    return fname, lname, email, phone, add1, city, state, zip_code
+
+async def send_webhook(url: str, data: dict, headers: Optional[Dict[str, str]] = None):
+    """Send webhook notification"""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            webhook_headers = {"Content-Type": "application/json"}
+            if headers:
+                webhook_headers.update(headers)
+            await client.post(url, json=data, headers=webhook_headers)
+    except Exception as e:
+        print(f"Webhook failed: {e}")
+
+# ========== ENTRY POINT ==========
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
