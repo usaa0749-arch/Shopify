@@ -22,7 +22,6 @@ init(autoreset=True)
 import requests,random,string,bs4,base64
 from bs4 import *
 import time,uuid,json,re
-import user_agent
 import requests
 import re
 import time
