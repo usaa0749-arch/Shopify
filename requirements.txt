@@ -7,3 +7,4 @@ requests==2.32.3
 urllib3==2.2.3
 cloudscraper==1.2.71
 aiohttp==3.10.5
+gunicorn
