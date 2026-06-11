@@ -1,4 +1,4 @@
-# app.py - Complete Render-ready application
+# app.py - No API Key Required (Direct Access)
 import os
 import re
 import json
@@ -10,14 +10,13 @@ from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, HTTPException, Depends, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 import redis.asyncio as redis
 
 # ========== CONFIGURATION ==========
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-API_KEY = os.getenv("API_KEY", "change-me-in-render-environment-variables")
 PORT = int(os.getenv("PORT", 10000))
 ENVIRONMENT = os.getenv("ENVIRONMENT", "production")
 
@@ -51,24 +50,22 @@ class ChargeResponse(BaseModel):
 # ========== REDIS SETUP ==========
 redis_client: redis.Redis = None
 
-# ========== FASTAPI APP ==========
+# ========== FASTAPI APP (NO AUTH) ==========
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global redis_client
-    # Startup
     redis_client = await redis.from_url(REDIS_URL, decode_responses=True)
     await redis_client.ping()
     print(f"✅ Redis connected: {REDIS_URL}")
     print(f"🚀 API running on port {PORT}")
-    print(f"🔑 API Key configured: {API_KEY[:10]}...")
+    print(f"⚠️ NO API KEY REQUIRED - Direct access enabled")
     yield
-    # Shutdown
     if redis_client:
         await redis_client.close()
 
 app = FastAPI(
     title="Shopify Charge API",
-    description="Auto Shopify Payment Processor - Deployed on Render",
+    description="Auto Shopify Payment Processor - No Authentication Required",
     version="2.0.0",
     lifespan=lifespan
 )
@@ -81,22 +78,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ========== AUTH DEPENDENCY ==========
-async def verify_key(api_key: str = Query(..., alias="api_key")):
-    if api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    return api_key
-
-# ========== ENDPOINTS ==========
+# ========== ENDPOINTS (NO AUTH) ==========
 @app.get("/")
 async def root():
     return {
         "service": "Shopify Charge API",
         "status": "operational",
         "environment": ENVIRONMENT,
+        "auth": "disabled",
         "version": "2.0.0",
         "endpoints": {
-            "POST /charge": "Submit charge request",
+            "POST /charge": "Submit charge request (no API key needed)",
             "GET /status/{request_id}": "Check request status",
             "GET /health": "Health check"
         }
@@ -118,14 +110,12 @@ async def health():
 @app.post("/charge", response_model=ChargeResponse)
 async def create_charge(
     request: ChargeRequest,
-    background_tasks: BackgroundTasks,
-    api_key: str = Depends(verify_key)
+    background_tasks: BackgroundTasks
 ):
-    """Submit a card for Shopify checkout"""
+    """Submit a card for Shopify checkout - NO API KEY REQUIRED"""
     
     request_id = str(uuid.uuid4())
     
-    # Store in Redis
     await redis_client.hset(
         f"charge:{request_id}",
         mapping={
@@ -138,7 +128,6 @@ async def create_charge(
     )
     await redis_client.expire(f"charge:{request_id}", 3600)
     
-    # Process in background
     background_tasks.add_task(process_charge, request_id, request)
     
     return ChargeResponse(
@@ -148,8 +137,8 @@ async def create_charge(
     )
 
 @app.get("/status/{request_id}")
-async def get_status(request_id: str, api_key: str = Depends(verify_key)):
-    """Check charge request status"""
+async def get_status(request_id: str):
+    """Check charge request status - NO API KEY REQUIRED"""
     
     data = await redis_client.hgetall(f"charge:{request_id}")
     if not data:
@@ -183,7 +172,6 @@ async def process_charge(request_id: str, request: ChargeRequest):
             if not products:
                 raise Exception("No products found in store")
             
-            # Find product by handle or use first
             product = products[0]
             if request.product_handle:
                 for p in products:
@@ -214,14 +202,12 @@ async def process_charge(request_id: str, request: ChargeRequest):
             checkout_resp = await client.get(f"{request.shopify_url}/checkout")
             html = checkout_resp.text
             
-            # Extract session token
             session_token_match = re.search(r'serialized-sessionToken&quot;:&quot;([^&]+)&quot;', html)
             session_token = session_token_match.group(1) if session_token_match else None
             
             if not session_token:
                 raise Exception("Could not extract session token from checkout")
             
-            # Extract queue token and stable ID
             queue_token_match = re.search(r'queueToken&quot;:&quot;([^&]+)&quot;', html)
             queue_token = queue_token_match.group(1) if queue_token_match else ""
             
@@ -363,7 +349,6 @@ async def process_charge(request_id: str, request: ChargeRequest):
                 }
                 await redis_client.hset(f"charge:{request_id}", order_result)
                 
-                # Send webhook
                 if request.webhook_url:
                     await send_webhook(request.webhook_url, {
                         "request_id": request_id,
@@ -421,7 +406,6 @@ def generate_address():
     return fname, lname, email, phone, add1, city, state, zip_code
 
 async def send_webhook(url: str, data: dict, headers: Optional[Dict[str, str]] = None):
-    """Send webhook notification"""
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             webhook_headers = {"Content-Type": "application/json"}
